@@ -1,0 +1,441 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="UTF-8" />
+    <title>Roster Duty Application</title>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
+
+    <style>
+      body {
+        font-family: Arial;
+        background: #f4f6f8;
+        padding: 10px;
+      }
+      h2 {
+        text-align: center;
+      }
+      .box {
+        background: #fff;
+        padding: 12px;
+        border-radius: 8px;
+        margin-bottom: 10px;
+      }
+      input,
+      select,
+      button {
+        padding: 6px;
+        margin: 4px;
+      }
+
+      table {
+        border-collapse: collapse;
+        width: 100%;
+        background: #fff;
+        margin-top: 15px;
+      }
+      th,
+      td {
+        border: 1px solid #999;
+        padding: 4px;
+        text-align: center;
+        font-size: 12px;
+      }
+
+      .week-head {
+        background: #bbdefb;
+        font-weight: bold;
+      }
+      .date-head {
+        background: #e3f2fd;
+      }
+      .blank {
+        background: #f0f0f0;
+      }
+
+      .W {
+        background: #fff;
+      }
+      .D {
+        background: #90caf9;
+        font-weight: bold;
+      }
+      .H {
+        background: #a5d6a7;
+        font-weight: bold;
+      }
+      .NA {
+        background: #eee;
+      }
+    </style>
+  </head>
+
+  <body>
+    <h2>Roster Duty Generator</h2>
+
+    <div class="box">
+      <b>Add Employee</b><br />
+      Name <input id="empName" />
+      Priority
+      <select id="empPriority">
+        <option>High</option>
+        <option>Medium</option>
+        <option>Low</option>
+      </select>
+      Max Saturday <input id="empMax" type="number" value="1" min="0" />
+      <button onclick="addEmployee()">Add</button>
+      <div id="empList"></div>
+    </div>
+
+    <div class="box">
+      Month <input id="month" type="number" min="1" max="12" value="1" /> Year
+      <input id="year" type="number" value="2026" /><br />
+
+      Max Saturday Duty
+      <input id="maxSat" type="number" value="2" min="1" /> Max Comp-Off / Day
+      <input id="maxDayOff" type="number" value="1" min="1" /><br />
+
+      <button onclick="generate()">Generate</button>
+      <button onclick="downloadExcel()">Excel</button>
+      <button onclick="downloadImage()">Image</button>
+    </div>
+
+    <div id="tableArea"></div>
+    <div id="summaryArea"></div>
+
+    <script>
+      let employees = [];
+      let satCount = {};
+      let compOffCredits = [];
+      let carryForward = [];
+      let solutionIndex = 0;
+
+      function key(d) {
+        const y = d.getFullYear();
+        const m = String(d.getMonth() + 1).padStart(2, "0");
+        const day = String(d.getDate()).padStart(2, "0");
+        return `${y}-${m}-${day}`;
+      }
+
+      function renderEmpList() {
+        empList.innerHTML = employees
+          .map(
+            (e, i) => `
+    ${i + 1}. ${e.name} (${e.priority}, max ${e.maxRoster})
+    <button onclick="removeEmployee(${i})">❌</button>
+  `
+          )
+          .join("<br>");
+      }
+
+      function addEmployee() {
+        if (!empName.value.trim()) return;
+        employees.push({
+          name: empName.value.trim(),
+          priority: empPriority.value,
+          maxRoster: +empMax.value,
+        });
+        empName.value = "";
+        empMax.value = 1;
+        renderEmpList();
+      }
+
+      function removeEmployee(i) {
+        employees.splice(i, 1);
+        renderEmpList();
+        tableArea.innerHTML = "";
+        summaryArea.innerHTML = "";
+      }
+      function allocateNextMonthCompOff(list, maxDayOff, month, year) {
+        if (!list.length) return [];
+
+        const nextMonth = month === 11 ? 0 : month + 1;
+        const nextYear = month === 11 ? year + 1 : year;
+
+        const first = new Date(nextYear, nextMonth, 1);
+        const last = new Date(nextYear, nextMonth + 1, 0);
+
+        let dates = [];
+        for (let d = new Date(first); d <= last; d.setDate(d.getDate() + 1)) {
+          if ([2, 3, 4].includes(d.getDay())) dates.push(new Date(d));
+        }
+
+        let dayLoad = {};
+        dates.forEach((d) => (dayLoad[key(d)] = 0));
+
+        let result = [];
+
+        list.forEach((c) => {
+          for (let d of dates) {
+            const k = key(d);
+            if (dayLoad[k] >= maxDayOff) continue;
+
+            result.push({
+              emp: c.emp,
+              date: k,
+              from: c.from,
+            });
+
+            dayLoad[k]++;
+            break;
+          }
+        });
+
+        return result;
+      }
+
+      function rotate(arr, shift) {
+        if (!arr.length) return arr;
+        const s = shift % arr.length;
+        return arr.slice(s).concat(arr.slice(0, s));
+      }
+
+      function priorityRotate(list, step) {
+        const groups = {
+          High: list.filter((e) => e.priority === "High"),
+          Medium: list.filter((e) => e.priority === "Medium"),
+          Low: list.filter((e) => e.priority === "Low"),
+        };
+
+        function r(arr, s) {
+          if (!arr.length) return arr;
+          s = s % arr.length;
+          return arr.slice(s).concat(arr.slice(0, s));
+        }
+
+        return [
+          ...r(groups.High, step),
+          ...r(groups.Medium, step),
+          ...r(groups.Low, step),
+        ];
+      }
+
+      function generate() {
+        const m = +month.value - 1;
+        const y = +year.value;
+        const maxSat = +document.getElementById("maxSat").value;
+        const maxDayOff = +document.getElementById("maxDayOff").value;
+
+        satCount = {};
+        compOffCredits = [];
+        carryForward = [];
+        employees.forEach((e) => (satCount[e.name] = 0));
+        const rotatedEmployees = priorityRotate(employees, solutionIndex);
+
+        let first = new Date(y, m, 1);
+        let last = new Date(y, m + 1, 0);
+
+        let cal = [],
+          d = new Date(first);
+        d.setDate(d.getDate() - (d.getDay() || 7) + 1);
+        while (d <= last || d.getDay() != 1) {
+          cal.push(new Date(d));
+          d.setDate(d.getDate() + 1);
+        }
+
+        let roster = {},
+          summary = {};
+        employees.forEach((e) => {
+          roster[e.name] = {};
+          summary[e.name] = { D: [], H: [] };
+        });
+
+        cal.forEach((d) => {
+          employees.forEach((e) => {
+            if (d.getMonth() != m) roster[e.name][key(d)] = "";
+            else if (d.getDay() == 0) roster[e.name][key(d)] = "H";
+            else if (d.getDay() == 6) roster[e.name][key(d)] = "NA";
+            else roster[e.name][key(d)] = "W";
+          });
+        });
+
+        // ===== SATURDAY DUTY =====
+        for (let i = 0; i < cal.length; i += 7) {
+          let week = cal.slice(i, i + 7);
+          let sat = week.find((d) => d.getDay() == 6 && d.getMonth() == m);
+          if (!sat) continue;
+
+          let chosen = [];
+
+          /* ---------- STEP 1: MANDATORY HIGH / MEDIUM ---------- */
+          /* ---------- STEP 1: FORCE ONE HIGH / MEDIUM EVERY WEEK ---------- */
+          let hm = rotatedEmployees.filter((e) => e.priority !== "Low");
+
+          // prefer those under maxRoster
+          let availableHM = hm.filter((e) => satCount[e.name] < e.maxRoster);
+
+          // if all reached maxRoster, allow reuse (rule > limit)
+          let source = availableHM.length ? availableHM : hm;
+
+          // RANDOM pick one
+          const pick = source[Math.floor(Math.random() * source.length)];
+          chosen.push(pick.name);
+
+          //.sort((a, b) => satCount[a.name] - satCount[b.name]);
+
+          /*if (hm.length) {
+            const pick = hm[Math.floor(Math.random() * hm.length)];
+            chosen.push(pick.name);
+          }*/
+
+          /* ---------- STEP 2: FORCE EVERYONE TO GET AT LEAST ONE ---------- */
+          let mandatory = rotatedEmployees
+            .filter(
+              (e) =>
+                satCount[e.name] === 0 &&
+                satCount[e.name] < e.maxRoster &&
+                !chosen.includes(e.name)
+            )
+            .sort((a, b) => {
+              const p = { High: 0, Medium: 1, Low: 2 };
+              return p[a.priority] - p[b.priority];
+            });
+
+          for (let e of mandatory) {
+            if (chosen.length >= maxSat) break;
+            chosen.push(e.name);
+          }
+
+          /* ---------- STEP 3: FILL REMAINING FAIRLY ---------- */
+          let remaining = rotatedEmployees
+            .filter(
+              (e) => satCount[e.name] < e.maxRoster && !chosen.includes(e.name)
+            )
+            .sort((a, b) => {
+              if (satCount[a.name] !== satCount[b.name])
+                return satCount[a.name] - satCount[b.name];
+              const p = { High: 0, Medium: 1, Low: 2 };
+              return p[a.priority] - p[b.priority];
+            });
+
+          for (let e of remaining) {
+            if (chosen.length >= maxSat) break;
+            chosen.push(e.name);
+          }
+
+          chosen.forEach((n) => {
+            roster[n][key(sat)] = "D";
+            summary[n].D.push(sat.getDate());
+            satCount[n]++;
+            compOffCredits.push({ emp: n, after: key(sat) });
+          });
+        }
+
+        // ===== COMP OFF AFTER SATURDAY =====
+        let dayLoad = {};
+        cal.forEach((d) => (dayLoad[key(d)] = 0));
+
+        compOffCredits.forEach((c) => {
+          let placed = false;
+          for (let d of cal) {
+            if (d.getMonth() != m) continue;
+            if (key(d) <= c.after) continue;
+            if (![2, 3, 4].includes(d.getDay())) continue;
+            if (dayLoad[key(d)] >= maxDayOff) continue;
+
+            roster[c.emp][key(d)] = "H";
+            summary[c.emp].H.push(d.getDate());
+            dayLoad[key(d)]++;
+            placed = true;
+            break;
+          }
+          if (!placed) {
+            carryForward.push({
+              emp: c.emp,
+              from: c.after,
+            });
+          }
+        });
+        const nextMonthCompOff = allocateNextMonthCompOff(
+          carryForward,
+          maxDayOff,
+          m,
+          y
+        );
+        solutionIndex++;
+
+        renderTable(cal, roster);
+        renderSummary(summary, []);
+
+        summaryArea.innerHTML += renderNextMonthChart(nextMonthCompOff, m, y);
+      }
+
+      function renderTable(cal, roster) {
+        let html = "<table id='rosterTable'><tr><th>Employee</th>";
+        cal.forEach(
+          (d) =>
+            (html += `<th>${d.getDate()}<br>${d.toLocaleDateString("en", {
+              weekday: "short",
+            })}</th>`)
+        );
+        html += "</tr>";
+
+        employees.forEach((e) => {
+          html += `<tr><th>${e.name}</th>`;
+          cal.forEach((d) => {
+            let v = roster[e.name][key(d)];
+            html +=
+              v === ""
+                ? `<td class='blank'></td>`
+                : `<td class='${v}'>${v == "NA" ? "-" : v}</td>`;
+          });
+          html += "</tr>";
+        });
+        html += "</table>";
+        tableArea.innerHTML = html;
+      }
+
+      function renderSummary(sum, carry) {
+        let html =
+          "<h3>Employee Summary</h3><table><tr><th>Name</th><th>Saturday</th><th>Comp-Off</th></tr>";
+        for (let e in sum)
+          html += `<tr><td>${e}</td><td>${sum[e].D.join(",")}</td><td>${sum[
+            e
+          ].H.join(",")}</td></tr>`;
+        html += "</table>";
+
+        if (carry.length) {
+          html += "<h3>⏭ Carry Forward Comp-Off (Next Month)</h3><ul>";
+          carry.forEach((e) => (html += `<li>${e}</li>`));
+          html += "</ul>";
+        }
+        summaryArea.innerHTML = html;
+      }
+      function renderNextMonthChart(data, month, year) {
+        if (!data.length) return "";
+
+        const nm = month === 11 ? 0 : month + 1;
+        const ny = month === 11 ? year + 1 : year;
+
+        let html = `<h3>📅 Next Month Comp-Off (${nm + 1}/${ny})</h3>`;
+        html +=
+          "<table><tr><th>Employee</th><th>Comp-Off Date</th><th>From Saturday</th></tr>";
+
+        data.forEach((c) => {
+          html += `<tr>
+      <td>${c.emp}</td>
+      <td class="H">${c.date.split("-")[2]}</td>
+      <td>${c.from.split("-")[2]}</td>
+
+    </tr>`;
+        });
+
+        html += "</table>";
+        return html;
+      }
+
+      function downloadExcel() {
+        XLSX.writeFile(XLSX.utils.table_to_book(rosterTable), "Roster.xlsx");
+      }
+      function downloadImage() {
+        html2canvas(document.body).then((c) => {
+          let a = document.createElement("a");
+          a.href = c.toDataURL();
+          a.download = "Roster.png";
+          a.click();
+        });
+      }
+    </script>
+  </body>
+</html>
